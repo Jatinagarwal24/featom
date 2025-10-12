@@ -333,81 +333,149 @@ end subroutine compute_exact_hf_exchange_all_l
 
 
 subroutine radial_slater_integral_k(xe, xq, wtq, A, k, r, wJ, Avals, rpk, rpn, Rk)
-    ! Compute R_k = ∬ A(r) A(r') r_<^k / r_>^{k+1} dr dr' without double counting.
-    ! Implementation:
-    !  - Build flattened arrays (r, wJ, Avals) in globally ascending r.
-    !  - prefix(m)  = Σ_{t<=m} A_t r_t^k wJ_t
-    !  - suffix(m)  = Σ_{t>=m} A_t r_t^{-(k+1)} wJ_t
-    !  - Strictly exclude diagonal from one side: use prefix_lt = prefix - self, suffix_gt = suffix - self
-    !  - Rk = Σ_m [ wJ_m A_m ( r_m^{-(k+1)}*prefix_lt(m) + r_m^k*suffix_gt(m) ) ] + Σ_m [ wJ_m^2 A_m^2 / r_m ]
-
-    real(dp), intent(in) :: xe(:), xq(:,:), wtq(:), A(:,:)
-    integer,  intent(in) :: k
+    ! Compute R_k = ∬ A(r) A(r') r_<^k / r_>^{k+1} dr dr'
+    ! Numerically robust:
+    !  - global argsort of all (r, wJ, A) points across elements
+    !  - Kahan compensated summation for prefix/suffix and final accumulation
+    !  - strict < and > split, plus single diagonal add-back: Σ wJ^2 A^2 / r
+    !
+    ! Inputs:
+    !   xe(:)      element nodes
+    !   xq(:,:)    quadrature radii (Nq, Ne)
+    !   wtq(:)     parent quadrature weights (length Nq)
+    !   A(:,:)     pair radial product P_i P_j = u_i * u_j on (Nq, Ne)
+    !   k          multipole order (integer >= 0)
+    !
+    ! Work arrays (intent(inout) as per original signature, reused internally):
+    !   r(:), wJ(:), Avals(:), rpk(:), rpn(:) must have length Nq*Ne in caller
+    !
+    ! Output:
+    !   Rk         Slater-type radial integral
+    !
+    integer,  intent(in)    :: k
+    real(dp), intent(in)    :: xe(:), xq(:,:), wtq(:), A(:,:)
     real(dp), intent(inout) :: r(:), wJ(:), Avals(:), rpk(:), rpn(:)
-    real(dp), intent(out) :: Rk
+    real(dp), intent(out)   :: Rk
 
     integer :: Nq, Ne, M, e, q, m_idx, ofs
-    integer, allocatable :: ord(:)
-    real(dp) :: he, rr, wq, tinyr
+    integer, allocatable :: ord_global(:)
+    real(dp), allocatable :: rS(:), wJS(:), AS(:), rpkS(:), rpnS(:)
     real(dp), allocatable :: prefix(:), suffix(:)
-    real(dp) :: acc, self_pk, self_pn, term_lt, term_gt
+    real(dp) :: he, rr, wq, tinyr
+    real(dp) :: s, c, y, t, self_pk, self_pn
+    real(dp) :: Rk_acc, Rk_c, diag_acc, diag_c
 
-    Nq = size(xq,1); Ne = size(xq,2)
-    M  = Nq*Ne
+    Nq   = size(xq,1)
+    Ne   = size(xq,2)
+    M    = Nq*Ne
     tinyr = 1.0e-24_dp
 
-    ! Flatten with ascending r inside each element (sufficient, mesh is monotone)
+    ! 1) Flatten all element quadrature samples into (r, wJ, Avals)
     ofs = 0
     do e = 1, Ne
         he = 0.5_dp * (xe(e+1) - xe(e))
-        allocate(ord(Nq))
-        call argsort_ascending(xq(:,e), ord)
         do q = 1, Nq
-            ofs         = ofs + 1
-            rr          = max(xq(ord(q),e), tinyr)
-            wq          = wtq(ord(q)) * he
-            r(ofs)      = rr
-            wJ(ofs)     = wq
-            Avals(ofs)  = A(ord(q),e)
+            ofs        = ofs + 1
+            rr         = max(xq(q,e), tinyr)
+            wq         = wtq(q) * he
+            r(ofs)     = rr
+            wJ(ofs)    = wq
+            Avals(ofs) = A(q,e)
         end do
-        deallocate(ord)
     end do
 
+    ! 2) Global argsort by ascending r
+    allocate(ord_global(M))
+    call argsort_ascending_global(r, ord_global)
+
+    allocate(rS(M), wJS(M), AS(M), rpkS(M), rpnS(M), prefix(M), suffix(M))
+
     do m_idx = 1, M
-        rpk(m_idx) = r(m_idx)**k
-        rpn(m_idx) = r(m_idx)**(-k-1)
+        rS(m_idx)   = r(   ord_global(m_idx))
+        wJS(m_idx)  = wJ(  ord_global(m_idx))
+        AS(m_idx)   = Avals(ord_global(m_idx))
     end do
 
-    allocate(prefix(M), suffix(M))
-    acc = 0.0_dp
+    ! 3) Precompute r^k and r^(-k-1)
     do m_idx = 1, M
-        acc = acc + Avals(m_idx) * rpk(m_idx) * wJ(m_idx)
-        prefix(m_idx) = acc
+        rpkS(m_idx) = rS(m_idx)**k
+        rpnS(m_idx) = rS(m_idx)**(-k-1)
     end do
-    acc = 0.0_dp
+
+    ! 4) Kahan-compensated prefix: prefix(m) = Σ_{t<=m} AS(t)*rpkS(t)*wJS(t)
+    s = 0.0_dp; c = 0.0_dp
+    do m_idx = 1, M
+        y = AS(m_idx)*rpkS(m_idx)*wJS(m_idx) - c
+        t = s + y
+        c = (t - s) - y
+        s = t
+        prefix(m_idx) = s
+    end do
+
+    ! 5) Kahan-compensated suffix: suffix(m) = Σ_{t>=m} AS(t)*rpnS(t)*wJS(t)
+    s = 0.0_dp; c = 0.0_dp
     do m_idx = M, 1, -1
-        acc = acc + Avals(m_idx) * rpn(m_idx) * wJ(m_idx)
-        suffix(m_idx) = acc
+        y = AS(m_idx)*rpnS(m_idx)*wJS(m_idx) - c
+        t = s + y
+        c = (t - s) - y
+        s = t
+        suffix(m_idx) = s
     end do
 
-    Rk = 0.0_dp
+    ! 6) Assemble Rk with strict < and > split (exclude diagonal once), Kahan-accumulated
+    Rk_acc = 0.0_dp
+    Rk_c   = 0.0_dp
     do m_idx = 1, M
-        self_pk = Avals(m_idx) * rpk(m_idx) * wJ(m_idx)
-        self_pn = Avals(m_idx) * rpn(m_idx) * wJ(m_idx)
-
-        term_lt = rpn(m_idx) * (prefix(m_idx) - self_pk)   ! sum over t < m
-        term_gt = rpk(m_idx) * (suffix(m_idx) - self_pn)   ! sum over t > m
-
-        Rk = Rk + wJ(m_idx) * Avals(m_idx) * (term_lt + term_gt)
+        self_pk = AS(m_idx)*rpkS(m_idx)*wJS(m_idx)
+        self_pn = AS(m_idx)*rpnS(m_idx)*wJS(m_idx)
+        ! sum over t < m: use prefix(m_idx) - self_pk
+        ! sum over t > m: use suffix(m_idx) - self_pn
+        y = wJS(m_idx)*AS(m_idx) * ( rpnS(m_idx) * (prefix(m_idx) - self_pk) + rpkS(m_idx) * (suffix(m_idx) - self_pn) )
+        y = y - Rk_c
+        t = Rk_acc + y
+        Rk_c   = (t - Rk_acc) - y
+        Rk_acc = t
     end do
 
-    ! Add single diagonal once
+    ! 7) Add diagonal exactly once: Σ wJ^2 A^2 / r
+    diag_acc = 0.0_dp
+    diag_c   = 0.0_dp
     do m_idx = 1, M
-        Rk = Rk + (wJ(m_idx)*wJ(m_idx)) * (Avals(m_idx)*Avals(m_idx)) / r(m_idx)
+        y = (wJS(m_idx)*wJS(m_idx)) * (AS(m_idx)*AS(m_idx)) / rS(m_idx) - diag_c
+        t = diag_acc + y
+        diag_c   = (t - diag_acc) - y
+        diag_acc = t
     end do
 
-    deallocate(prefix, suffix)
+    Rk = Rk_acc + diag_acc
+
+    deallocate(ord_global, rS, wJS, AS, rpkS, rpnS, prefix, suffix)
 end subroutine radial_slater_integral_k
+
+
+subroutine argsort_ascending_global(v, idx)
+    ! Global argsort by ascending v(:)
+    real(dp), intent(in)  :: v(:)
+    integer, intent(out)  :: idx(:)
+    integer :: n, i, j, imin, tmp
+
+    n = size(v)
+    do i = 1, n
+        idx(i) = i
+    end do
+    ! Simple selection sort is fine for typical M (<= a few thousand)
+    do i = 1, n-1
+        imin = i
+        do j = i+1, n
+            if (v(idx(j)) < v(idx(imin))) imin = j
+        end do
+        if (imin /= i) then
+            tmp     = idx(i)
+            idx(i)  = idx(imin)
+            idx(imin) = tmp
+        end if
+    end do
+end subroutine argsort_ascending_global
 
 
 subroutine argsort_ascending(v, idx)
