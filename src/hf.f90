@@ -1,21 +1,20 @@
 module hf
 
 use types, only: dp
-use mesh, only: meshexp
+use mesh,  only: meshexp
 use feutils, only: define_connect, get_quad_pts, get_parent_quad_pts_wts, &
-        get_parent_nodes, phih, dphih, c2fullc2, fe2quad_core, get_nodes, &
-        integrate, proj_fn, phih_array, dphih_array
+                   get_parent_nodes, phih, dphih, c2fullc2, fe2quad_core, get_nodes, &
+                   integrate, proj_fn, phih_array, dphih_array
 use linalg, only: eigh
-use fe, only: assemble_radial_H, assemble_radial_S, assemble_radial_H_setup, &
-        assemble_radial_H_complete
+use fe,     only: assemble_radial_H, assemble_radial_S, assemble_radial_H_setup, &
+                   assemble_radial_H_complete
 use constants, only: pi
 use hartree_screening, only: assemble_poisson_A, hartree_potential3
 use mixings, only: mixing_anderson
-use states, only: get_atomic_states_nonrel_focc, nlf2focc, get_atomic_states_nonrel
+use states,  only: get_atomic_states_nonrel_focc, nlf2focc, get_atomic_states_nonrel
 use energies, only: thomas_fermi_potential
 use iso_c_binding, only: c_double, c_int
 use solvers, only: solve_eig_irange, solve_sym_setup
-use lapack, only: dsytrf, dsytrs
 implicit none
 private
 public solve_hf_schroed
@@ -23,254 +22,444 @@ public solve_hf_schroed
 contains
 
 subroutine solve_hf_schroed(Z, p, xiq, wtq, xe, eps, energies, Etot, V, DOFs)
-
     integer, intent(in) :: Z, p
-    real(dp), intent(in) :: xe(:)        ! element coordinates
-    real(dp), intent(in) :: xiq(:)       ! quadrature points
-    real(dp), intent(in) :: wtq(:)       ! quadrature weights
+    real(dp), intent(in) :: xe(:), xiq(:), wtq(:)
     real(dp), intent(in) :: eps
     real(dp), allocatable, intent(out) :: energies(:)
     real(dp), intent(out) :: Etot
-    real(dp), intent(out) :: V(:,:)       ! SCF potential
+    real(dp), allocatable, intent(out) :: V(:,:)
     integer, intent(out) :: DOFs
-    integer :: n, Nq
-    real(dp), allocatable :: H(:,:), S(:), D(:,:), lam(:)
 
-    real(dp), allocatable :: xin(:)       ! parent basis nodes
-    integer, allocatable :: ib(:, :)       ! basis connectivity
-    integer, allocatable :: in(:, :)
-    real(dp), allocatable :: xq(:, :), fullc(:), uq(:,:), rho(:,:), Vee(:,:), &
-        Vx(:,:), Vin(:,:), Vout(:,:), xn(:), xq1(:,:), Am_p(:,:), &
-        bv_p(:), Hl(:,:,:)
-    integer, allocatable :: ipiv(:)
-    real(dp), allocatable :: phihq(:,:)   ! parent basis at quadrature points
-    real(dp), allocatable :: dphihq(:,:)  ! parent basis derivative at quadrature points
+    integer :: Nq, Ne, Nb, Nn, pp, Nb_p, Nn_p
+    real(dp), allocatable :: xin(:), xn(:), xin_p(:), xn_p(:)
+    integer, allocatable :: in(:, :), ib(:, :), in_p(:, :), ib_p(:, :)
+    real(dp), allocatable :: xq(:, :), phihq(:,:), dphihq(:,:)
+    real(dp), allocatable :: phihq_p(:,:), dphihq_p(:,:)
 
-    real(dp), allocatable :: xin_p(:)       ! parent basis nodes for poisson grid
-    real(dp), allocatable :: xn_p(:)
-    real(dp), allocatable :: phihq_p(:,:)   ! parent basis at quadrature points
-    real(dp), allocatable :: dphihq_p(:,:)  ! parent basis derivative at quadrature points
-    integer, allocatable :: in_p(:, :), ib_p(:, :)
-
-    integer :: Ne, Nb, Nn, Nb_p, Nn_p, pp
-    integer :: l, i, j, Lmax, al, eimin, eimax
-    real(dp), allocatable :: focc(:,:), tmp(:)
-    real(dp) :: scf_alpha, scf_L2_eps, scf_eig_eps
+    integer :: n, Lmax, l, i, j, al, eimax, iter
     integer, allocatable :: no(:), lo(:), focc_idx(:,:)
-    real(dp), allocatable :: fo(:)
-    real(dp) :: T_s, E_ee, E_en, E_x
+    real(dp), allocatable :: focc(:,:), fo(:)
+
+    real(dp), allocatable :: H(:,:), S(:), D(:,:), lam(:), fullc(:)
+    real(dp), allocatable :: Hl(:,:,:)      ! per-l base H (no V)
+    real(dp), allocatable :: Am_p(:,:), bv_p(:)
+    integer, allocatable :: ipiv(:)
+
+    real(dp), allocatable :: uq(:,:), rho(:,:), n_r(:,:), Vee(:,:), Vx(:,:), Vin(:,:), Vout(:,:), Veff(:,:)
+    real(dp), allocatable :: orbitals(:,:,:), orbital_densities(:,:,:)
+
+    real(dp) :: scf_alpha, scf_L2_eps, scf_eig_eps
+    integer :: nband, scf_max_iter
+    real(dp), allocatable :: tmp(:)
+    real(dp) :: Etot_Slater, Etot_old
+    real(dp) :: E_x_LDA, E_H, E_band, En_coupling, E_x_exact
+
     real(dp) :: xiq_lob(p+1), wtq_lob(p+1)
 
-
-    integer :: nband, scf_max_iter, iter
-
     Nq = size(xiq)
-    Ne = size(xe)-1
+    Ne = size(xe) - 1
 
     call get_parent_quad_pts_wts(2, p+1, xiq_lob, wtq_lob)
 
     call get_atomic_states_nonrel_focc(Z, focc)
     call get_atomic_states_nonrel(Z, no, lo, fo)
+    Lmax = ubound(focc, 2)
 
-    Lmax = ubound(focc,2)
-
-    Nn = Ne*p+1
-
-    allocate(xin(p+1))
-    call get_parent_nodes(2, p, xin)
-    allocate(in(p+1, Ne), ib(p+1, Ne))
-    call define_connect(1, 1, Ne, p, in, ib)
+    Nn = Ne*p + 1
+    allocate(xin(p+1));  call get_parent_nodes(2, p, xin)
+    allocate(in(p+1,Ne), ib(p+1,Ne)); call define_connect(1, 1, Ne, p, in, ib)
     Nb = maxval(ib)
-    if ( .not. (Nn == maxval(in)) ) then
-       error stop 'Wrong size for Nn'
-    end if
+    if (Nn /= maxval(in)) error stop 'Wrong size for Nn'
     DOFs = Nb
-    allocate(xq(Nq, Ne), xn(Nn))
-    call get_quad_pts(xe, xiq, xq)
-    call get_nodes(xe, xin, xn)
+
+    allocate(xq(Nq,Ne)); call get_quad_pts(xe, xiq, xq)
+    allocate(xn(Nn));    call get_nodes(xe, xin, xn)
 
     pp = 2*p
-    Nn_p = Ne*pp+1
-    allocate(xin_p(pp+1))
-    call get_parent_nodes(2, pp, xin_p)
-    allocate(in_p(pp+1, Ne), ib_p(pp+1, Ne))
-    call define_connect(2, 1, Ne, pp, in_p, ib_p)
+    Nn_p = Ne*pp + 1
+    allocate(xin_p(pp+1));  call get_parent_nodes(2, pp, xin_p)
+    allocate(in_p(pp+1,Ne), ib_p(pp+1,Ne)); call define_connect(2, 1, Ne, pp, in_p, ib_p)
     Nb_p = maxval(ib_p)
-    if ( .not. (Nn_p == maxval(in_p)) ) then
-       error stop 'Wrong size for Nn_p'
-    end if
-    allocate(xn_p(Nn_p))
-    call get_nodes(xe, xin_p, xn_p)
+    if (Nn_p /= maxval(in_p)) error stop 'Wrong size for Nn_p'
+    allocate(xn_p(Nn_p));   call get_nodes(xe, xin_p, xn_p)
 
-
-    allocate(phihq(Nq, p+1))
-    allocate(dphihq(Nq, p+1))
-    allocate(phihq_p(Nq, pp+1))
-    allocate(dphihq_p(Nq, pp+1))
-    ! tabulate parent basis at quadrature points
-    do al = 1, p+1
-        call phih_array(xin, al, xiq, phihq(:, al))
-        call dphih_array(xin, al, xiq, dphihq(:, al))
+    allocate(phihq(Nq,p+1), dphihq(Nq,p+1))
+    allocate(phihq_p(Nq,pp+1), dphihq_p(Nq,pp+1))
+    do al=1, p+1
+        call phih_array(xin,  al, xiq, phihq(:,al))
+        call dphih_array(xin, al, xiq, dphihq(:,al))
     end do
-    do al = 1, pp+1
-        call phih_array(xin_p, al, xiq, phihq_p(:, al))
-        call dphih_array(xin_p, al, xiq, dphihq_p(:, al))
+    do al=1, pp+1
+        call phih_array(xin_p,  al, xiq, phihq_p(:,al))
+        call dphih_array(xin_p, al, xiq, dphihq_p(:,al))
     end do
 
     n = Nb
-    allocate(H(n, n), S(n))
-    allocate(D(n, n), lam(n), fullc(Nn), uq(Nq,Ne), rho(Nq,Ne), Vee(Nq,Ne), &
-        Vx(Nq,Ne), Vin(Nq,Ne), Vout(Nq,Ne))
+    allocate(H(n,n), S(n))
+    allocate(D(n,n), lam(n), fullc(Nn))
+    allocate(uq(Nq,Ne), rho(Nq,Ne), n_r(Nq,Ne))
+    allocate(Vee(Nq,Ne), Vx(Nq,Ne), Vin(Nq,Ne), Vout(Nq,Ne), Veff(Nq,Ne))
 
-    nband = count(focc > 0)
-    scf_max_iter = 100
-    scf_alpha = 0.25_dp ! A conservative alpha is good for Anderson
-    scf_L2_eps = 1e-7_dp
-    scf_eig_eps = eps
+    nband        = count(focc > 0.0_dp)
+    scf_max_iter = 400
+    scf_alpha    = 0.20_dp
+    scf_L2_eps   = 1.0e-9_dp
+    scf_eig_eps  = eps*0.001
+    allocate(tmp(Nq*Ne), energies(nband))
 
-    allocate(tmp(Nq*Ne))
-    allocate(energies(nband))
-    Vin = reshape(thomas_fermi_potential(reshape(xq, [Nq*Ne]), Z), [Nq, Ne]) + &
-        Z / xq
+    Vin  = reshape(thomas_fermi_potential(reshape(xq, [Nq*Ne]), Z), [Nq,Ne]) + real(Z,dp) / xq
     iter = 0
     Etot = 0.0_dp
-    print *, "Starting SCF calculation..."
-    print *, "Iter |   Total Energy   |  dEnergy  |  dV (L2)"
+
+    print *, "=============================================================="
+    print *, "Restricted Hartree-Fock: Slater-SCF + exact exchange (all l via multipoles)"
+    print *, "=============================================================="
+    print *, "Iter |   E_Slater (Ha)  |  dE      |  ||ΔV||_L2"
 
     call assemble_radial_S(xin, xe, ib, wtq_lob, S)
-    do i = 1, size(S)
-        S(i) = 1/sqrt(S(i))
+    do i=1, size(S)
+        S(i) = 1.0_dp/sqrt(S(i))
     end do
 
-    allocate(Am_p(Nb_p, Nb_p), bv_p(Nb_p), ipiv(Nb_p))
-    Am_p = 0
+    allocate(Am_p(Nb_p,Nb_p), bv_p(Nb_p), ipiv(Nb_p))
+    Am_p = 0.0_dp
     call assemble_poisson_A(xin_p, xe, ib_p, xiq, wtq, dphihq_p, Am_p)
     call solve_sym_setup(Am_p, ipiv)
 
     allocate(Hl(n,n,0:Lmax))
     call assemble_radial_H_setup(0, Lmax, xin, xe, ib, xiq, wtq, phihq, dphihq, Hl)
 
-    allocate(focc_idx(size(focc,1), 0:Lmax))
-    focc_idx = 0
-    j=1
+    allocate(focc_idx(size(focc,1), 0:Lmax)); focc_idx = 0
+    j = 1
     do l=0, Lmax
-        do i=1,size(focc,1)
-            if (focc(i,l) > 0) then
+        do i=1, size(focc,1)
+            if (focc(i,l) > 0.0_dp) then
                 focc_idx(i,l) = j
                 j = j + 1
             end if
         end do
     end do
 
-    call mixing_anderson &
-        (Ffunc, integral, reshape(Vin, [Nq*Ne]), &
-        nband, scf_max_iter, scf_alpha, scf_L2_eps, scf_eig_eps, tmp)
+    allocate(orbitals(Nq,Ne,nband), orbital_densities(Nq,Ne,nband))
+
+    call mixing_anderson(Ffunc, integral, reshape(Vin, [Nq*Ne]), &
+                         nband, scf_max_iter, scf_alpha, scf_L2_eps, scf_eig_eps, tmp)
+
+    call compute_exact_hf_exchange_all_l(xe, xiq, wtq, xq, orbitals, focc_idx, focc, E_x_exact)
+
+    E_band      = sum(fo * energies)
+    n_r         = -rho
+    En_coupling = 4.0_dp*pi * integrate(xe, wtq, n_r * (Vee + Vx) * xq**2)
+    E_H         = 0.5_dp * 4.0_dp*pi * integrate(xe, wtq, n_r * Vee * xq**2)
+    Etot        = E_band - En_coupling + E_H + E_x_exact
+    V           = -real(Z,dp)/xq + Vee + Vx
+
+    print *, ""
+    print '(a, f16.10, a)', "Post-SCF exact exchange (all l): ", E_x_exact, " Ha"
+    print '(a, f16.10, a)', "Final RHF total energy:         ", Etot,      " Ha"
+    print *, "=============================================================="
 
 contains
 
     subroutine Ffunc(x, y, eng)
-    real(dp), intent(in) :: x(:)
-    real(dp), intent(out) :: y(:), eng(:)
-    integer :: idx
-    real(dp) :: Etot_old
-    Etot_old = Etot
-    iter = iter + 1
-    Vin = reshape(x, shape(Vin))
-    rho = 0
-    idx = 0
-    V = Vin - Z/xq
+        real(dp), intent(in)  :: x(:)
+        real(dp), intent(out) :: y(:), eng(:)
+        integer :: i_local, j_local, idx
 
-    do l = 0, Lmax
-        call assemble_radial_H_complete(V, xin, xe, ib, xiq, wtq, phihq, Hl(:,:,l), H)
+        Etot_old = Etot
+        iter     = iter + 1
+        Vin      = reshape(x, shape(Vin))
+        rho      = 0.0_dp
+        idx      = 0
 
-        do concurrent (i = 1:size(S), j = 1:size(S), i>=j)
-            H(i, j) = H(i, j)*S(i)*S(j)
+        Veff = Vin - real(Z,dp)/xq
+
+        do l=0, Lmax
+            call assemble_radial_H_complete(Veff, xin, xe, ib, xiq, wtq, phihq, Hl(:,:,l), H)
+
+            do concurrent(i_local=1:size(S), j_local=1:size(S), i_local >= j_local)
+                H(i_local,j_local) = H(i_local,j_local) * S(i_local) * S(j_local)
+            end do
+
+            eimax = 0
+            do i_local=1, size(focc,1)
+                if (focc(i_local,l) > 0.0_dp) eimax = i_local
+            end do
+            if (eimax == 0) cycle
+
+            call solve_eig_irange(H, 1, eimax, lam, D)
+
+            do i_local=1, size(S)
+                D(i_local,1:eimax) = D(i_local,1:eimax) * S(i_local)
+            end do
+
+            do i_local=1, eimax
+                if (focc(i_local,l) <= tiny(1.0_dp)) cycle
+
+                call c2fullc2(in, ib, D(:Nb,i_local), fullc)
+                call fe2quad_core(xe, xin, in, fullc, phihq, uq)
+
+                idx = focc_idx(i_local,l)
+                eng(idx)                  = lam(i_local)
+                orbitals(:,:,idx)         = uq
+                orbital_densities(:,:,idx)= (uq/xq)**2 / (4.0_dp*pi)
+
+                rho = rho - focc(i_local,l) * orbital_densities(:,:,idx)
+            end do
         end do
+        energies = eng
 
-        eimax = 0
-        do i=1, size(focc,1)
-            if (focc(i,l) > 0) eimax = i
-        end do
-        if (eimax == 0) cycle
+        Vee = hartree_potential3(real(Z,dp), pp, xe, xin_p, in_p, ib_p, xiq, wtq, &
+                                 phihq_p, Am_p, ipiv, -4.0_dp*pi*rho)
 
-        call solve_eig_irange(H, 1, eimax, lam, D)
+        call slater_exchange_potential(-rho, Vx)
+        Vout = Vee + Vx
 
-        do i = 1, size(S)
-            D(i, 1:eimax) = D(i, 1:eimax)*S(i)
-        end do
+        E_x_LDA     = 0.75_dp * 4.0_dp*pi * integrate(xe, wtq, (-rho) * Vx  * xq**2)
+        E_band      = sum(fo * energies)
+        E_H         = 0.5_dp * 4.0_dp*pi * integrate(xe, wtq, (-rho) * Vee * xq**2)
+        En_coupling = 4.0_dp*pi * integrate(xe, wtq, (-rho) * (Vee + Vx) * xq**2)
+        Etot_Slater = E_band - En_coupling + E_H + E_x_LDA
 
-        do i = 1, eimax
-            if (focc(i,l) < tiny(1._dp)) cycle
+        if (iter > 1) then
+            print '(i4, " | ", f16.8, " | ", es9.2, " | ", es9.2)', &
+                   iter, Etot_Slater, Etot_Slater-Etot_old, &
+                   sqrt(integrate(xe, wtq, (Vout - (Vin - real(Z,dp)/xq))**2))
+        else
+            print '(i4, " | ", f16.8, " | ", a9, " | ", a9)', iter, Etot_Slater, '---', '---'
+        end if
 
-            call c2fullc2(in, ib, D(:Nb,i), fullc)
-            call fe2quad_core(xe, xin, in, fullc, phihq, uq)
-            rho = rho - focc(i,l)*(uq/xq)**2 / (4*pi)
-
-            idx = focc_idx(i,l)
-            eng(idx) = lam(i)
-        end do
-    end do
-    energies = eng
-
-    Vee = hartree_potential3(real(Z, dp), pp, xe, xin_p, in_p, ib_p, xiq, wtq, phihq_p, Am_p, ipiv, -4*pi*rho)
-    call slater_exchange_potential(rho, Vx)
-    call hf_total_energy_slater(xe, wtq, fo, energies, Vin-Z/xq, Vee, -Z/xq, xq, -rho, T_s, E_ee, E_en, E_x, Etot)
-
-    Vout = Vee + Vx
-
-    if (iter > 1) then
-        print '(i4, " | ", f16.8, " | ", es9.2, " | ", es9.2)', iter, Etot, Etot-Etot_old, sqrt(integrate(xe, wtq, (Vout-Vin)**2))
-    else
-        print '(i4, " | ", f16.8, " | ", a9, " | ", a9)', iter, Etot, '---', '---'
-    end if
-
-    y = reshape(Vout, shape(y))
-    end subroutine
+        y   = reshape(Vout, shape(y))
+        Etot= Etot_Slater
+    end subroutine Ffunc
 
     real(dp) function integral(x)
-    real(dp), intent(in) :: x(:)
-    integral = integrate(xe, wtq, reshape(x, shape(uq)))
-    end function
-end subroutine
+        real(dp), intent(in) :: x(:)
+        integral = integrate(xe, wtq, reshape(x, [size(xq,1), size(xq,2)]))
+    end function integral
+
+end subroutine solve_hf_schroed
 
 
-subroutine slater_exchange_potential(rho, Vx)
-    ! Calculates the Slater local exchange potential (alpha=1)
-    ! V_x = - (3/2) * (3/pi)^(1/3) * rho^(1/3)
-    real(dp), intent(in) :: rho(:,:)
+subroutine slater_exchange_potential(n, Vx)
+    real(dp), intent(in)  :: n(:,:)
     real(dp), intent(out) :: Vx(:,:)
-    real(dp), parameter :: C_x = -1.5_dp * (3.0_dp / pi)**(1.0_dp/3.0_dp)
+    real(dp), parameter :: Cx = - (3.0_dp/pi)**(1.0_dp/3.0_dp)
 
-    Vx = C_x * sign(1.0_dp, rho) * abs(rho)**(1.0_dp/3.0_dp)
-end subroutine
+    Vx = 0.0_dp
+    where (n > 1.0e-18_dp)
+        Vx = Cx * n**(1.0_dp/3.0_dp)
+    end where
+end subroutine slater_exchange_potential
 
 
-subroutine hf_total_energy_slater(xe, wtq, fo, ks_energies, V_in, V_h, V_coulomb, &
-    R, n, T_s, E_ee, E_en, E_x, Etot)
-    real(dp), intent(in) :: xe(:), wtq(:)
-    real(dp), intent(in) :: R(:,:)
-    real(dp), intent(in) :: fo(:), ks_energies(:)
-    real(dp), intent(in) :: V_in(:,:), V_h(:,:), V_coulomb(:,:)
-    real(dp), intent(in) :: n(:,:)
-    real(dp), intent(out) :: Etot
-    real(dp), intent(out) :: T_s, E_ee, E_en, E_x
+subroutine compute_exact_hf_exchange_all_l(xe, xiq, wtq, xq, orbitals, focc_idx, focc, E_x)
+    ! Exact HF exchange for all occupied (n,l) pairs via multipole expansion.
+    ! Angular factor: (2l_i+1)(2l_j+1) * [ ( l_i  k  l_j ; 0 0 0 ) ]^2
+    ! Radial integral R_k uses P(r)=u(r) with ∫ u^2 dr = 1 (no r^2 factor).
 
-    real(dp) :: rho(size(n,1), size(n,2))
-    real(dp) :: E_band
-    real(dp) :: V_x(size(n,1), size(n,2))
+    real(dp), intent(in) :: xe(:), xiq(:), wtq(:), xq(:,:)
+    real(dp), intent(in) :: orbitals(:,:,:)
+    integer,  intent(in) :: focc_idx(:,0:)
+    real(dp), intent(in) :: focc(:,0:)
+    real(dp), intent(out):: E_x
 
-    rho = -n
+    integer :: Nq, Ne, nbocc, a, b, n_i, l_i, n_j, l_j, k, kmin, kmax
+    integer, allocatable :: bands(:), nlist(:), llist(:)
+    real(dp) :: threej, angfac, Rk
+    real(dp), allocatable :: A_t(:,:), r(:), wJ(:), Avals(:), rpk(:), rpn(:)
 
-    call slater_exchange_potential(rho, V_x)
-    E_x = 0.75_dp * 4*pi * integrate(xe, wtq, rho * V_x * R**2)
+    Nq = size(xq,1); Ne = size(xq,2)
 
-    E_band = sum(fo * ks_energies)
-    T_s = E_band + 4*pi * integrate(xe, wtq, (V_in) * rho * R**2)
+    ! Build occupied (n,l) list
+    nbocc = 0
+    do l_i = 0, ubound(focc,2)
+        do n_i = 1, size(focc,1)
+            if (focc(n_i,l_i) > 0.0_dp) nbocc = nbocc + 1
+        end do
+    end do
+    if (nbocc == 0) then
+        E_x = 0.0_dp; return
+    end if
+    allocate(bands(nbocc), nlist(nbocc), llist(nbocc))
+    nbocc = 0
+    do l_i = 0, ubound(focc,2)
+        do n_i = 1, size(focc,1)
+            if (focc(n_i,l_i) > 0.0_dp) then
+                nbocc = nbocc + 1
+                bands(nbocc) = focc_idx(n_i,l_i)
+                nlist(nbocc) = n_i
+                llist(nbocc) = l_i
+            end if
+        end do
+    end do
 
-    E_ee = -2*pi * integrate(xe, wtq, V_h * rho * R**2)
-    E_en =  4*pi * integrate(xe, wtq, (-V_coulomb) * rho * R**2)
+    allocate(A_t(Nq,Ne))
+    allocate(r(Nq*Ne), wJ(Nq*Ne), Avals(Nq*Ne), rpk(Nq*Ne), rpn(Nq*Ne))
 
-    Etot = T_s + E_ee + E_en + E_x
-end subroutine
+    E_x = 0.0_dp
+
+    do a = 1, nbocc
+        l_i = llist(a)
+        n_i = nlist(a)
+        do b = 1, nbocc
+            l_j = llist(b)
+            n_j = nlist(b)
+
+            ! Pair product P_i P_j = u_i u_j
+            A_t = orbitals(:,:,bands(a)) * orbitals(:,:,bands(b))
+
+            kmin = abs(l_i - l_j)
+            kmax = l_i + l_j
+
+            do k = kmin, kmax
+                if (mod(l_i + l_j + k, 2) /= 0) cycle  ! parity
+
+                threej = wigner3j_000(l_i, k, l_j)
+                if (abs(threej) < 1.0e-30_dp) cycle
+
+                angfac = real((2*l_i+1)*(2*l_j+1), dp) * (threej*threej)
+
+                call radial_slater_integral_k(xe, xq, wtq, A_t, k, r, wJ, Avals, rpk, rpn, Rk)
+
+                ! No extra 1/2 or occupancy weights here (closed-shell spatial set)
+                E_x = E_x - angfac * Rk
+            end do
+        end do
+    end do
+
+    deallocate(bands, nlist, llist, A_t, r, wJ, Avals, rpk, rpn)
+end subroutine compute_exact_hf_exchange_all_l
+
+
+subroutine radial_slater_integral_k(xe, xq, wtq, A, k, r, wJ, Avals, rpk, rpn, Rk)
+    ! Compute R_k = ∬ A(r) A(r') r_<^k / r_>^{k+1} dr dr' without double counting.
+    ! Implementation:
+    !  - Build flattened arrays (r, wJ, Avals) in globally ascending r.
+    !  - prefix(m)  = Σ_{t<=m} A_t r_t^k wJ_t
+    !  - suffix(m)  = Σ_{t>=m} A_t r_t^{-(k+1)} wJ_t
+    !  - Strictly exclude diagonal from one side: use prefix_lt = prefix - self, suffix_gt = suffix - self
+    !  - Rk = Σ_m [ wJ_m A_m ( r_m^{-(k+1)}*prefix_lt(m) + r_m^k*suffix_gt(m) ) ] + Σ_m [ wJ_m^2 A_m^2 / r_m ]
+
+    real(dp), intent(in) :: xe(:), xq(:,:), wtq(:), A(:,:)
+    integer,  intent(in) :: k
+    real(dp), intent(inout) :: r(:), wJ(:), Avals(:), rpk(:), rpn(:)
+    real(dp), intent(out) :: Rk
+
+    integer :: Nq, Ne, M, e, q, m_idx, ofs
+    integer, allocatable :: ord(:)
+    real(dp) :: he, rr, wq, tinyr
+    real(dp), allocatable :: prefix(:), suffix(:)
+    real(dp) :: acc, self_pk, self_pn, term_lt, term_gt
+
+    Nq = size(xq,1); Ne = size(xq,2)
+    M  = Nq*Ne
+    tinyr = 1.0e-24_dp
+
+    ! Flatten with ascending r inside each element (sufficient, mesh is monotone)
+    ofs = 0
+    do e = 1, Ne
+        he = 0.5_dp * (xe(e+1) - xe(e))
+        allocate(ord(Nq))
+        call argsort_ascending(xq(:,e), ord)
+        do q = 1, Nq
+            ofs         = ofs + 1
+            rr          = max(xq(ord(q),e), tinyr)
+            wq          = wtq(ord(q)) * he
+            r(ofs)      = rr
+            wJ(ofs)     = wq
+            Avals(ofs)  = A(ord(q),e)
+        end do
+        deallocate(ord)
+    end do
+
+    do m_idx = 1, M
+        rpk(m_idx) = r(m_idx)**k
+        rpn(m_idx) = r(m_idx)**(-k-1)
+    end do
+
+    allocate(prefix(M), suffix(M))
+    acc = 0.0_dp
+    do m_idx = 1, M
+        acc = acc + Avals(m_idx) * rpk(m_idx) * wJ(m_idx)
+        prefix(m_idx) = acc
+    end do
+    acc = 0.0_dp
+    do m_idx = M, 1, -1
+        acc = acc + Avals(m_idx) * rpn(m_idx) * wJ(m_idx)
+        suffix(m_idx) = acc
+    end do
+
+    Rk = 0.0_dp
+    do m_idx = 1, M
+        self_pk = Avals(m_idx) * rpk(m_idx) * wJ(m_idx)
+        self_pn = Avals(m_idx) * rpn(m_idx) * wJ(m_idx)
+
+        term_lt = rpn(m_idx) * (prefix(m_idx) - self_pk)   ! sum over t < m
+        term_gt = rpk(m_idx) * (suffix(m_idx) - self_pn)   ! sum over t > m
+
+        Rk = Rk + wJ(m_idx) * Avals(m_idx) * (term_lt + term_gt)
+    end do
+
+    ! Add single diagonal once
+    do m_idx = 1, M
+        Rk = Rk + (wJ(m_idx)*wJ(m_idx)) * (Avals(m_idx)*Avals(m_idx)) / r(m_idx)
+    end do
+
+    deallocate(prefix, suffix)
+end subroutine radial_slater_integral_k
+
+
+subroutine argsort_ascending(v, idx)
+    real(dp), intent(in) :: v(:)
+    integer, intent(out) :: idx(:)
+    integer :: i, j, n, imin, tmp
+    n = size(v)
+    do i = 1, n
+        idx(i) = i
+    end do
+    do i = 1, n-1
+        imin = i
+        do j = i+1, n
+            if (v(idx(j)) < v(idx(imin))) imin = j
+        end do
+        if (imin /= i) then
+            tmp = idx(i); idx(i) = idx(imin); idx(imin) = tmp
+        end if
+    end do
+end subroutine argsort_ascending
+
+
+pure real(dp) function wigner3j_000(l1, l2, l3) result(val)
+    integer, intent(in) :: l1, l2, l3
+    integer :: L, sgn
+    real(dp) :: lnval
+
+    if ( (abs(l1-l2) > l3) .or. (l1 + l2 < l3) ) then
+        val = 0.0_dp; return
+    end if
+    L = l1 + l2 + l3
+    if (mod(L,2) /= 0) then
+        val = 0.0_dp; return
+    end if
+
+    sgn = 1
+    if (mod(L/2,2) /= 0) sgn = -1
+
+    lnval = 0.5_dp*( lnfac(L - 2*l1) + lnfac(L - 2*l2) + lnfac(L - 2*l3) - lnfac(L + 1) ) &
+            + lnfac(L/2) - ( lnfac(L/2 - l1) + lnfac(L/2 - l2) + lnfac(L/2 - l3) )
+
+    val = sgn * exp(lnval)
+end function wigner3j_000
+
+
+pure real(dp) function lnfac(n) result(l)
+    integer, intent(in) :: n
+    if (n < 0) then
+        l = -huge(1.0_dp)
+    else
+        l = log_gamma(real(n+1, dp))
+    end if
+end function lnfac
 
 end module
