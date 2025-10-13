@@ -14,8 +14,7 @@ dependencies:
   - pkg-config
   - openblas
   - meson
-  - intel::intel-openmp
-  - mkl-devel=2023.2=ha770c72_49502
+  - openmp 
   - ninja
   - cmake
   # Documentation

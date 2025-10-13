@@ -1,7 +1,7 @@
 name: Build and Test
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 on:
@@ -11,82 +11,57 @@ on:
     branches: [main]
 
 jobs:
-  buildfpm:
+  build_and_test:
+    name: Build with ${{ matrix.build_system }}
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        build_system: [fpm, meson]
+
     steps:
       - name: Checkout code
-        uses: actions/checkout@v2
-      - name: Install packages
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
         run: |
-          set -ex
-          echo "Update information of package list.."
           sudo apt-get update
-          echo "Install Fortran compiler .."
-          sudo apt-get install -y gfortran
-          echo "Install OpenMP headers .."
-          sudo apt-get install -y libomp-dev
-          echo "Install lapack .."
-          sudo apt-get install -y libopenblas-dev liblapack-dev
-          echo "install meson"
-          sudo apt-get install -y meson
+          sudo apt-get install -y \
+            gfortran \
+            libomp-dev \
+            libopenblas-dev \
+            liblapack-dev \
+            meson
 
       - name: Install fpm
+        if: matrix.build_system == 'fpm'
         uses: fortran-lang/setup-fpm@v5
         with:
           fpm-version: 'v0.9.0'
 
-      - name: Build featom
+      - name: Build and Test (Debug) with fpm
+        if: matrix.build_system == 'fpm'
         run: |
-          set -ex
           fpm build
-
-      - name: Test featom
-        run: |
-          set -ex
           fpm test
-
-      - name: Test convergence
-        run: |
-          set -ex
           fpm run gpd_coulomb_schroed_nelements
 
-      - name: Test Release Mode
+      - name: Build and Test (Release) with fpm
+        if: matrix.build_system == 'fpm'
         run: |
-          set -ex
           fpm test --profile=release
           fpm run --profile=release gpd_coulomb_schroed_nelements
 
-  buildmeson:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v2
-      - name: Install packages
+      - name: Configure and Build with meson
+        if: matrix.build_system == 'meson'
         run: |
-          set -ex
-          echo "Update information of package list.."
-          sudo apt-get update
-          echo "Install Fortran compiler .."
-          sudo apt-get install -y gfortran
-          echo "Install OpenMP headers .."
-          sudo apt-get install -y libomp-dev
-          echo "Install lapack .."
-          sudo apt-get install -y libopenblas-dev liblapack-dev
-          echo "install meson"
-          sudo apt-get install -y meson
+          meson setup builddir -Dwith_tests=True -Dwith_app=True
+          meson compile -C builddir
 
-      - name: Build featom
-        run: |
-          set -ex
-          meson setup bbdir -Dwith_tests=True -Dwith_app=True
+      - name: Test with meson
+        if: matrix.build_system == 'meson'
+        run: meson test -C builddir
 
-      - name: Test featom
-        run: |
-          set -ex
-          meson test -C bbdir
-
-      - name: Test convergence [release]
-        run: |
-          set -ex
-          meson compile -C bbdir
-          ./bbdir/app/gpd_coulomb_schroed_nelements
+      - name: Run convergence app with meson
+        if: matrix.build_system == 'meson'
+        run: ./builddir/app/gpd_coulomb_schroed_nelements

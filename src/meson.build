@@ -8,6 +8,7 @@ _srcs = [
   'graphs.f90',
   'graphs_potential.f90',
   'hartree_screening.f90',
+  'hf.f90',
   'lapack.f90',
   'linalg.f90',
   'mesh.f90',
