@@ -1,71 +1,66 @@
-name: Build documentation
+name: Build and Deploy Documentation
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
-on: [push, pull_request]
+
 jobs:
   build_docs:
     name: Build documentation
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: true
     steps:
-      - uses: actions/checkout@v3
-      - uses: mamba-org/setup-micromamba@v1
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up micromamba
+        uses: mamba-org/setup-micromamba@v1
         with:
           environment-file: environment.yml
-          init-shell: >-
-            bash
+          init-shell: bash
           cache-environment: true
           post-cleanup: 'all'
-      - name: Get external tags
+
+      - name: Prepare Doxygen prerequisites
         shell: bash -el {0}
         run: |
           cd apidocs
+          # Get external tags for C++ standard library linking
           mkdir -p tags
-          cd tags
-          curl https://upload.cppreference.com/mwiki/images/f/f8/cppreference-doxygen-web.tag.xml -o cppreference-doxygen-web.tag.xml
-      - name: Get Theme
-        shell: bash -el {0}
-        run: |
-          cd apidocs
+          curl -L https://upload.cppreference.com/mwiki/images/f/f8/cppreference-doxygen-web.tag.xml -o tags/cppreference-doxygen-web.tag.xml
+          # Get the Doxygen theme
           wget https://github.com/HaoZeke/doxyYoda/releases/download/0.0.2/doxyYoda_0.0.2.tar.gz
           tar xf doxyYoda_0.0.2.tar.gz
-      - name: Generate Docs
+
+      - name: Generate Doxygen documentation
         shell: bash -el {0}
-        run: |
-          doxygen apidocs/Doxygen-featom.cfg
-      - name: Archive artifact
-        shell: sh
-        if: runner.os == 'Linux'
-        run: |
-          tar \
-          --dereference --hard-dereference \
-          --exclude=.git \
-          --exclude=.github \
-          -cvf "$RUNNER_TEMP/artifact.tar" \
-          --directory=html .
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v3
+        run: doxygen apidocs/Doxygen-featom.cfg
+
+      - name: Upload documentation artifact
+        uses: actions/upload-artifact@v4
         with:
           name: github-pages
-          path: ${{ runner.temp }}/artifact.tar
+          path: html/
           if-no-files-found: error
-  # Deploy job
   deploy:
-    # Add a dependency to the build job
     needs: build_docs
-    if: github.event_name == 'push' && github.repository == 'atomic-solvers/featom'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository == 'atomic-solvers/featom'
     permissions:
-      pages: write      # to deploy to Pages
-      id-token: write   # to verify the deployment originates from an appropriate source
-    # Deploy to the github-pages environment
+      pages: write
+      id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
-    # Specify runner + deployment step
+
     runs-on: ubuntu-latest
     steps:
       - name: Deploy to GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@v2 # or the latest "vX.X.X" version tag for this action
+        uses: actions/deploy-pages@v4
